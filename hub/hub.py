@@ -3,6 +3,7 @@ import json
 import os
 import socket
 import struct
+import sys
 import threading
 import time
 
@@ -10,7 +11,8 @@ PORT = 4243                     # phone -> hub
 OPENTRACK = ("127.0.0.1", 4242)  # hub -> opentrack ("UDP over network" input)
 CFG_PATH = os.path.join(os.path.expanduser("~"), ".phonecam_hub.json")
 AXES = ["X", "Y", "Z", "Yaw", "Pitch", "Roll"]
-DEFAULTS = {"rot": 1.0, "pos": 1.0, "smooth": 0.3, "inv": [False] * 6, "forward": True}
+DEFAULTS = {"rot": 1.0, "pos": 1.0, "smooth": 0.3, "inv": [False] * 6, "forward": True,
+            "mouse": 12.0, "hold_rmb": True}
 
 
 def load_cfg():
@@ -48,6 +50,46 @@ def local_ips():
     return sorted(i for i in ips if not i.startswith("127."))
 
 
+# ---- Mouse emulation (Windows). Used by "Mouse look mode" for cameras that only take mouse input.
+if sys.platform == "win32":
+    import ctypes
+    from ctypes import wintypes
+
+    class _MOUSEINPUT(ctypes.Structure):
+        _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG), ("mouseData", wintypes.DWORD),
+                    ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+    class _UNION(ctypes.Union):
+        _fields_ = [("mi", _MOUSEINPUT)]
+
+    class _INPUT(ctypes.Structure):
+        _fields_ = [("type", wintypes.DWORD), ("u", _UNION)]
+
+    def _send_mouse(flags, dx=0, dy=0):
+        inp = _INPUT(type=0, u=_UNION(mi=_MOUSEINPUT(dx, dy, 0, flags, 0, 0)))
+        ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT))
+
+    def mouse_move(dx, dy):
+        _send_mouse(0x0001, dx, dy)  # MOUSEEVENTF_MOVE (relative)
+
+    def mouse_button(down):
+        _send_mouse(0x0008 if down else 0x0010)  # right button down / up
+
+    def key_down(vk):
+        return bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
+else:
+    def mouse_move(dx, dy):
+        pass
+
+    def mouse_button(down):
+        pass
+
+    def key_down(vk):
+        return False
+
+VK_F8 = 0x77
+
+
 class Core:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -58,6 +100,10 @@ class Core:
         self.last_rx = 0.0
         self.last_addr = None
         self.error = None
+        self.mouse_on = False
+        self.last_m = None
+        self.acc_x = 0.0
+        self.acc_y = 0.0
         self.fwd = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     def process(self, raw):
@@ -78,6 +124,37 @@ class Core:
         self.prev = v
         self.out = v
         return v
+
+    def set_mouse(self, on):
+        """Mouse look mode: phone rotation drives the mouse instead of opentrack head tracking."""
+        if on == self.mouse_on:
+            return
+        self.mouse_on = on
+        self.last_m = None
+        self.acc_x = self.acc_y = 0.0
+        if self.cfg["hold_rmb"]:
+            mouse_button(on)
+        if on:  # park the in-cab view in the middle while mouse mode is active
+            try:
+                self.fwd.sendto(struct.pack("<6d", *([0.0] * 6)), OPENTRACK)
+            except OSError:
+                pass
+
+    def _mouse(self, v):
+        if self.last_m is None:
+            self.last_m = list(v)
+            return
+        dyaw = (v[3] - self.last_m[3] + 180) % 360 - 180
+        dpitch = v[4] - self.last_m[4]
+        self.last_m = list(v)
+        k = self.cfg["mouse"]
+        self.acc_x += dyaw * k
+        self.acc_y += -dpitch * k
+        ix, iy = int(self.acc_x), int(self.acc_y)
+        self.acc_x -= ix
+        self.acc_y -= iy
+        if ix or iy:
+            mouse_move(ix, iy)
 
     def serve(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -100,9 +177,11 @@ class Core:
             if len(data) < 48:
                 continue
             v = self.process(struct.unpack("<6d", data[:48]))
+            if self.mouse_on:
+                self._mouse(v)
             self.last_rx = time.time()
             self.last_addr = addr[0]
-            if self.cfg["forward"]:
+            if self.cfg["forward"] and not self.mouse_on:
                 try:
                     self.fwd.sendto(struct.pack("<6d", *v), OPENTRACK)
                 except OSError:
@@ -119,7 +198,7 @@ def main():
 
     root = tk.Tk()
     root.title("PhoneCam Hub")
-    root.geometry("470x600")
+    root.geometry("500x720")
     pad = {"padx": 12, "pady": 4}
 
     ttk.Label(root, text="PhoneCam Hub", font=("Segoe UI", 16, "bold")).pack(anchor="w", **pad)
@@ -148,6 +227,7 @@ def main():
     slider("Rotation sensitivity", "rot", 0.2, 3.0)
     slider("Movement sensitivity", "pos", 0.0, 3.0)
     slider("Smoothing", "smooth", 0.0, 0.95)
+    slider("Mouse sensitivity (px/deg)", "mouse", 2.0, 40.0)
 
     ttk.Label(root, text="Invert axes (tick if a direction is backwards):").pack(anchor="w", **pad)
     inv_frame = ttk.Frame(root)
@@ -169,6 +249,21 @@ def main():
 
     ttk.Checkbutton(root, text="Send to opentrack", variable=fwd_var, command=on_fwd).pack(anchor="w", **pad)
 
+    mouse_var = tk.BooleanVar(value=False)
+
+    def on_mouse():
+        core.set_mouse(mouse_var.get())
+
+    ttk.Checkbutton(root, text="Mouse look mode (hotkey F8) - for external / free camera",
+                    variable=mouse_var, command=on_mouse).pack(anchor="w", **pad)
+    rmb_var = tk.BooleanVar(value=cfg["hold_rmb"])
+
+    def on_rmb():
+        cfg["hold_rmb"] = rmb_var.get()
+
+    ttk.Checkbutton(root, text="Hold right mouse button in mouse mode (needed for camera 2)",
+                    variable=rmb_var, command=on_rmb).pack(anchor="w", **pad)
+
     def recenter():
         core.recenter_req = True
 
@@ -180,6 +275,16 @@ def main():
         "Phone: open PhoneCam, tap 'Find PC' (or type the address above), tap Start sending."
     )
     ttk.Label(root, text=help_text, wraplength=440, foreground="gray").pack(anchor="w", **pad)
+
+    f8 = {"prev": False}
+
+    def poll_hotkey():
+        down = key_down(VK_F8)
+        if down and not f8["prev"]:
+            mouse_var.set(not mouse_var.get())
+            core.set_mouse(mouse_var.get())
+        f8["prev"] = down
+        root.after(50, poll_hotkey)
 
     def tick():
         if core.error:
@@ -193,11 +298,13 @@ def main():
         root.after(200, tick)
 
     def on_close():
+        core.set_mouse(False)
         save_cfg(cfg)
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", on_close)
     tick()
+    poll_hotkey()
     root.mainloop()
 
 
